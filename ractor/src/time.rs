@@ -116,7 +116,7 @@ where
     // Tokio and our internal version for `async_std` provide an interval timer which
     // accounts for execution time to send a message and changes in polling to wake
     // the task to assure that the period doesn't drift over long runtimes.
-    crate::concurrency::spawn(async move {
+    crate::concurrency::spawn(traced(async move {
         let mut timer = crate::concurrency::interval(period);
         // timer tick's immediately the first time
         timer.tick().await;
@@ -128,7 +128,7 @@ where
                 break;
             }
         }
-    })
+    }))
 }
 
 /// Sends a message after a given period to the specified actor. The task terminates
@@ -151,10 +151,10 @@ where
     TMessage: Message,
     F: FnOnce() -> TMessage + Send + 'static,
 {
-    crate::concurrency::spawn(async move {
+    crate::concurrency::spawn(traced(async move {
         crate::concurrency::sleep(period).await;
         actor.send_message::<TMessage>(msg())
-    })
+    }))
 }
 
 /// Sends the stop signal to the actor after a specified duration, attaching a reason
@@ -166,10 +166,10 @@ where
 /// Returns: The [JoinHandle] which denotes the backgrounded operation. To cancel the
 /// exit operation, you can abort the handle
 pub fn exit_after(period: Duration, actor: ActorCell) -> JoinHandle<()> {
-    crate::concurrency::spawn(async move {
+    crate::concurrency::spawn(traced(async move {
         crate::concurrency::sleep(period).await;
         actor.stop(Some(format!("Exit after {}ms", period.as_millis())))
-    })
+    }))
 }
 
 /// Sends the KILL signal to the actor after a specified duration
@@ -180,10 +180,26 @@ pub fn exit_after(period: Duration, actor: ActorCell) -> JoinHandle<()> {
 /// Returns: The [JoinHandle] which denotes the backgrounded operation. To cancel the
 /// kill operation, you can abort the handle
 pub fn kill_after(period: Duration, actor: ActorCell) -> JoinHandle<()> {
-    crate::concurrency::spawn(async move {
+    crate::concurrency::spawn(traced(async move {
         crate::concurrency::sleep(period).await;
         actor.kill()
-    })
+    }))
+}
+
+/// Wraps a timer task's future in a root `timer` span, so the sends it makes
+/// from outside any actor are attributed.
+///
+/// This should be called before spawning, while the spawner's span is current.
+fn traced<F: std::future::Future>(future: F) -> impl std::future::Future<Output = F::Output> {
+    let span = tracing::trace_span!(
+        // Explicitly make this a root; without this the span would be a child
+        // of the spawning function.
+        parent: None,
+        "timer"
+    );
+    // Links back to the spawner, which `parent: None` would otherwise drop.
+    span.follows_from(tracing::Span::current());
+    tracing::Instrument::instrument(future, span)
 }
 
 /// Add the timing functionality on top of the [crate::ActorRef]
@@ -235,7 +251,7 @@ where
         // IMPORTANT: See notes on `send_interval` above for important implementation
         // notes
         let self_clone = self.clone();
-        crate::concurrency::spawn(async move {
+        crate::concurrency::spawn(traced(async move {
             let mut timer = crate::concurrency::interval(period);
             // timer tick's immediately the first time
             timer.tick().await;
@@ -247,7 +263,7 @@ where
                     break;
                 }
             }
-        })
+        }))
     }
 
     /// Alias of [send_after]
@@ -260,11 +276,11 @@ where
         F: FnOnce() -> TMessage + Send + 'static,
     {
         let self_clone = self.clone();
-        crate::concurrency::spawn(async move {
+        crate::concurrency::spawn(traced(async move {
             crate::concurrency::sleep(period).await;
             let msg = msg();
             self_clone.send_message(msg)
-        })
+        }))
     }
 
     /// Alias of [exit_after]

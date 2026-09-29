@@ -207,6 +207,7 @@ impl ActorProperties {
         let boxed = message
             .box_message(&self.id)
             .map_err(|_e| MessagingErr::InvalidActorType)?;
+        tracing::trace!(name: "send", target: "ractor::message", flow_out = boxed.message_id);
         self.message
             .send(MuxedMessage::Message(boxed))
             .map_err(|e| match e.0 {
@@ -305,6 +306,7 @@ impl ActorProperties {
             serialized_msg: Some(message),
             #[cfg(feature = "message_span_propogation")]
             span: None,
+            message_id: crate::message::next_message_id(),
         };
         Ok(self
             .message

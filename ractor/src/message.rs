@@ -66,6 +66,7 @@ pub struct BoxedMessage {
     pub serialized_msg: Option<SerializedMessage>,
     #[cfg(feature = "message_span_propogation")]
     pub(crate) span: Option<tracing::Span>,
+    pub(crate) message_id: u64,
 }
 
 impl std::fmt::Debug for BoxedMessage {
@@ -140,6 +141,7 @@ pub trait Message: Any + Send + Sized + 'static {
                 serialized_msg: Some(self.serialize()?),
                 #[cfg(feature = "message_span_propogation")]
                 span: None,
+                message_id: next_message_id(),
             })
         } else if pid.is_local() {
             Ok(BoxedMessage {
@@ -147,6 +149,7 @@ pub trait Message: Any + Send + Sized + 'static {
                 serialized_msg: None,
                 #[cfg(feature = "message_span_propogation")]
                 span: current_message_span(),
+                message_id: next_message_id(),
             })
         } else {
             Err(BoxedDowncastErr)
@@ -161,6 +164,7 @@ pub trait Message: Any + Send + Sized + 'static {
             msg: Some(Box::new(self)),
             #[cfg(feature = "message_span_propogation")]
             span: current_message_span(),
+            message_id: next_message_id(),
         })
     }
 
@@ -211,6 +215,14 @@ impl<T: Any + Send + Sized + 'static + crate::serialization::BytesConvertable> M
             _ => Err(BoxedDowncastErr),
         }
     }
+}
+
+/// Identifies a message across its `send` event and `handle` span, which
+/// tracing consumers find by the `ractor::message` target and join on the
+/// `flow_out` / `flow_in` fields.
+pub(crate) fn next_message_id() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 #[cfg(feature = "message_span_propogation")]

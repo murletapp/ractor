@@ -14,7 +14,6 @@ use std::sync::Mutex;
 
 use futures::FutureExt;
 use futures::TryFutureExt;
-#[cfg(feature = "message_span_propogation")]
 use tracing::Instrument;
 
 use super::ThreadLocalActor;
@@ -278,7 +277,8 @@ impl<TActor: ThreadLocalActor> ThreadLocalActorRuntime<TActor> {
     /// Returns a [Ok((ActorRef, JoinHandle<()>))] upon successful start, denoting the actor reference
     /// along with the join handle which will complete when the actor terminates. Returns [Err(SpawnErr)] if
     /// the actor failed to start
-    #[tracing::instrument(name = "Actor", skip(self, ports, startup_args, supervisor), fields(id = self.id.to_string(), name = self.name))]
+    // Set `actor` so that tasks spawned during `pre_start` are attributed to the new actor, not its spawner.
+    #[tracing::instrument(name = "start", skip(self, ports, startup_args, supervisor), fields(id = self.id.to_string(), actor = self.name))]
     async fn start(
         self,
         ports: ActorPortSet,
@@ -337,12 +337,12 @@ impl<TActor: ThreadLocalActor> ThreadLocalActorRuntime<TActor> {
                 lifecycle.mark_running();
 
                 // run the processing loop, backgrounding the work
+                let loop_span = crate::actor::loop_span(&id, name.as_deref());
                 let handle = crate::concurrency::spawn_local(async move {
                     let myself = actor_ref.clone();
-                    let evt = match Self::processing_loop(
-                        ports, &mut state, &handler, actor_ref, id, name,
-                    )
-                    .await
+                    let evt = match Self::processing_loop(ports, &mut state, &handler, actor_ref)
+                        .instrument(loop_span)
+                        .await
                     {
                         // IMPORTANT: Because the State in ThreadLocalActor's is not Send, we cannot
                         // construct a boxed state since it can't be sent to the supervisor
@@ -375,14 +375,11 @@ impl<TActor: ThreadLocalActor> ThreadLocalActorRuntime<TActor> {
         Ok((myself_ret, handle))
     }
 
-    #[tracing::instrument(name = "Actor", skip(ports, state, handler, myself, _id, _name), fields(id = _id.to_string(), name = _name))]
     async fn processing_loop(
         mut ports: ActorPortSet,
         state: &mut TActor::State,
         handler: &TActor,
         myself: ActorRef<TActor::Msg>,
-        _id: ActorId,
-        _name: Option<String>,
     ) -> Result<Option<String>, ActorErr> {
         // perform the post-start, with supervision enabled
         match ports
@@ -586,25 +583,19 @@ impl<TActor: ThreadLocalActor> ThreadLocalActorRuntime<TActor> {
         let mut msg = msg;
         #[cfg(feature = "message_span_propogation")]
         let current_span_when_message_was_sent = msg.span.take();
+        let handle_span =
+            tracing::trace_span!(target: "ractor::message", "handle", flow_in = msg.message_id);
 
         // An error here will bubble up to terminate the actor
         let typed_msg = TActor::Msg::from_boxed(msg)?;
 
+        let handled = handler.handle(myself, typed_msg, state);
+        // Innermost, so spans created in the handler stay children of the
+        // sender's span.
         #[cfg(feature = "message_span_propogation")]
-        {
-            if let Some(span) = current_span_when_message_was_sent {
-                handler
-                    .handle(myself, typed_msg, state)
-                    .instrument(span)
-                    .await
-            } else {
-                handler.handle(myself, typed_msg, state).await
-            }
-        }
-        #[cfg(not(feature = "message_span_propogation"))]
-        {
-            handler.handle(myself, typed_msg, state).await
-        }
+        let handled = handled
+            .instrument(current_span_when_message_was_sent.unwrap_or_else(tracing::Span::none));
+        handled.instrument(handle_span).await
     }
 
     fn handle_signal(myself: ActorRef<TActor::Msg>, signal: Signal) -> Option<String> {

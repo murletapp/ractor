@@ -57,7 +57,6 @@ use std::panic::AssertUnwindSafe;
 
 use actor_properties::MuxedMessage;
 use futures::TryFutureExt;
-#[cfg(feature = "message_span_propogation")]
 use tracing::Instrument;
 
 use crate::concurrency::JoinHandle;
@@ -770,7 +769,8 @@ where
     /// Returns a [Ok((ActorRef, JoinHandle<()>))] upon successful start, denoting the actor reference
     /// along with the join handle which will complete when the actor terminates. Returns [Err(SpawnErr)] if
     /// the actor failed to start
-    #[tracing::instrument(name = "Actor", skip(self, ports, startup_args, supervisor), fields(id = self.id.to_string(), name = self.name))]
+    // Set `actor` so that tasks spawned during `pre_start` are attributed to the new actor, not its spawner.
+    #[tracing::instrument(name = "start", skip(self, ports, startup_args, supervisor), fields(id = self.id.to_string(), actor = self.name))]
     async fn start(
         self,
         mut ports: ActorPortSet,
@@ -824,9 +824,11 @@ where
         let myself_ret = actor_ref.clone();
 
         // run the processing loop, backgrounding the work
+        let loop_span = loop_span(&id, name.as_deref());
         let handle = crate::concurrency::spawn_named(actor_ref.get_name().as_deref(), async move {
             let myself = actor_ref.clone();
-            let evt = match Self::processing_loop(ports, &mut state, &handler, actor_ref, id, name)
+            let evt = match Self::processing_loop(ports, &mut state, &handler, actor_ref)
+                .instrument(loop_span)
                 .await
             {
                 Ok(exit_reason) => SupervisionEvent::ActorTerminated(
@@ -850,14 +852,11 @@ where
         Ok((myself_ret, handle))
     }
 
-    #[tracing::instrument(name = "Actor", skip(ports, state, handler, myself, _id, _name), fields(id = _id.to_string(), name = _name))]
     async fn processing_loop(
         mut ports: ActorPortSet,
         state: &mut TActor::State,
         handler: &TActor,
         myself: ActorRef<TActor::Msg>,
-        _id: ActorId,
-        _name: Option<String>,
     ) -> Result<Option<String>, ActorErr> {
         // perform the post-start, with supervision enabled
         match ports
@@ -1064,6 +1063,8 @@ where
         let mut msg = msg;
         #[cfg(feature = "message_span_propogation")]
         let current_span_when_message_was_sent = msg.span.take();
+        let handle_span =
+            tracing::trace_span!(target: "ractor::message", "handle", flow_in = msg.message_id);
 
         #[cfg(feature = "cluster")]
         let typed_msg = if msg.serialized_msg.is_some() {
@@ -1091,21 +1092,13 @@ where
         #[cfg(not(feature = "cluster"))]
         let typed_msg = TActor::Msg::from_boxed(msg)?;
 
+        let handled = handler.handle(myself, typed_msg, state);
+        // Innermost, so spans created in the handler stay children of the
+        // sender's span.
         #[cfg(feature = "message_span_propogation")]
-        {
-            if let Some(span) = current_span_when_message_was_sent {
-                handler
-                    .handle(myself, typed_msg, state)
-                    .instrument(span)
-                    .await
-            } else {
-                handler.handle(myself, typed_msg, state).await
-            }
-        }
-        #[cfg(not(feature = "message_span_propogation"))]
-        {
-            handler.handle(myself, typed_msg, state).await
-        }
+        let handled = handled
+            .instrument(current_span_when_message_was_sent.unwrap_or_else(tracing::Span::none));
+        handled.instrument(handle_span).await
     }
 
     fn handle_signal(myself: ActorRef<TActor::Msg>, signal: Signal) -> Option<String> {
@@ -1158,4 +1151,21 @@ where
             .await
             .map_err(|err| ActorErr::Failed(get_panic_string(err)))
     }
+}
+
+/// The `Actor` span for a processing loop.
+///
+/// This should be called before spawning, while the spawner's span is current.
+pub(crate) fn loop_span(id: &ActorId, name: Option<&str>) -> tracing::Span {
+    let span = tracing::info_span!(
+        // Explicitly make this a root; without this the span would be a child
+        // of the spawning function.
+        parent: None,
+        "Actor",
+        id = id.to_string(),
+        actor = name
+    );
+    // Links back to the spawner, which `parent: None` would otherwise drop.
+    span.follows_from(tracing::Span::current());
+    span
 }

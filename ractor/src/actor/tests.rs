@@ -1587,6 +1587,7 @@ async fn drain_defers_marker_for_reentrant_admitted_send() {
                 serialized_msg: None,
                 #[cfg(feature = "message_span_propogation")]
                 span: None,
+                message_id: crate::message::next_message_id(),
             })
         }
     }
